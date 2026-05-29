@@ -1,15 +1,14 @@
 absl-py==2.3.1
 accelerate==1.10.1
--e git+ssh://git@github.com/FFY0/AdaKV.git@67a0fc2729800c3d902225f359e0b50f9202556b#egg=adakv
+-e git+https://github.com/FFY0/AdaKV.git@67a0fc2729800c3d902225f359e0b50f9202556b#egg=adakv
 aiohappyeyeballs==2.6.1
 aiohttp==3.12.15
 aiosignal==1.4.0
-asttokens @ file:///home/conda/feedstock_root/build_artifacts/asttokens_1733250440834/work
-attrs==25.3.0
+asttokens
 certifi==2024.12.14
 charset-normalizer==3.4.0
 click==8.2.1
-comm @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_comm_1753453984/work
+comm 
 datasets==2.19.2
 debugpy @ file:///croot/debugpy_1736267418885/work
 decorator @ file:///home/conda/feedstock_root/build_artifacts/decorator_1740384970518/work

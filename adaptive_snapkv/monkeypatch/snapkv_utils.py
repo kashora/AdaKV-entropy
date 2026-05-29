@@ -82,11 +82,15 @@ class DynamicCacheSplitHeadFlatten(Cache):
 
     @classmethod
     def from_legacy_cache(cls, past_key_values: Optional[Tuple[Tuple[torch.FloatTensor]]] = None) -> "DynamicCacheEachHead":
-        """Converts a cache in the legacy cache format into an equivalent `DynamicCache`."""
         cache = cls()
+        if isinstance(past_key_values, Cache):
+            return cache
         if past_key_values is not None:
             for layer_idx in range(len(past_key_values)):
                 key_states, value_states = past_key_values[layer_idx]
+                if isinstance(key_states, (tuple, list)):
+                    key_states = torch.cat([x.unsqueeze(0) for x in key_states], dim=0)
+                    value_states = torch.cat([x.unsqueeze(0) for x in value_states], dim=0)
                 cache.update(key_states, value_states, layer_idx)
         return cache
 
@@ -336,17 +340,34 @@ class AdaptiveSnapKVCluster():
         bsz, num_heads, q_len, head_dim = query_states.shape
         attn_weights = torch.matmul(query_states[..., -self.window_size:, :], key_states.transpose(2, 3)) / math.sqrt(
             head_dim)
-        mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min,
-                          device=attn_weights.device)
-        mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
-        mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
-        mask = mask.to(attn_weights.device)
-        attention_mask = mask[None, None, :, :]
+        
 
-        attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+        # mask = torch.full((self.window_size, self.window_size), torch.finfo(attn_weights.dtype).min,
+        #                   device=attn_weights.device)
+        # mask_cond = torch.arange(mask.size(-1), device=attn_weights.device)
+        # mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+        # mask = mask.to(attn_weights.device)
+        # attention_mask = mask[None, None, :, :]
+
+        # attn_weights[:, :, -self.window_size:, -self.window_size:] += attention_mask
+
+        n_q = attn_weights.shape[-2]         # actual query positions (≤ window_size)
+        n_k = min(attn_weights.shape[-1], self.window_size)  # actual key positions
+        mask = torch.full((n_q, n_k), torch.finfo(attn_weights.dtype).min,
+                          device=attn_weights.device)
+        mask_cond = torch.arange(n_k, device=attn_weights.device)
+        mask.masked_fill_(mask_cond < (mask_cond + 1).view(n_k, 1), 0)
+        attention_mask = mask[None, None, :, :]
+        attn_weights[:, :, -n_q:, -n_k:] += attention_mask
+
+
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size].mean(dim=-2)
+        attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size]
+        if attn_weights_mean.shape[-1] == 0:
+            bsz, num_heads, _, _ = attn_weights.shape
+            return torch.zeros(bsz, num_heads, 0, device=attn_weights.device, dtype=attn_weights.dtype)
+        attn_weights_mean = attn_weights_mean.mean(dim=-2)
 
         if self.gqa_support:
             attn_weights_mean = attn_weights_mean.view(attn_weights_mean.shape[0],num_heads//self.num_key_value_groups,self.num_key_value_groups,-1)

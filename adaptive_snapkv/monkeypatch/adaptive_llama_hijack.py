@@ -78,8 +78,13 @@ def adaptive_LlamaModel_forward(
     #     )
 
     # NOTE: adakv
+    from transformers.cache_utils import Cache as HFCache
     return_legacy_cache = True
-    past_key_values = DynamicCacheSplitHeadFlatten.from_legacy_cache(past_key_values)
+    if isinstance(past_key_values, HFCache):
+        past_key_values = DynamicCacheSplitHeadFlatten()
+        past_key_values._seen_tokens = past_key_values.get_seq_length() if hasattr(past_key_values, 'get_seq_length') else 0
+    else:
+        past_key_values = DynamicCacheSplitHeadFlatten.from_legacy_cache(past_key_values)
     logger.warning_once(
         "We detected that you are passing `past_key_values` as a tuple and this is deprecated and will be removed in v4.43. "
         "Please use an appropriate `Cache` class (https://huggingface.co/docs/transformers/v4.41.3/en/internal/generation_utils#transformers.Cache)"
@@ -149,10 +154,11 @@ def adaptive_LlamaModel_forward(
         all_hidden_states += (hidden_states,)
 
     next_cache = next_decoder_cache if use_cache else None
-    if return_legacy_cache:
+    if return_legacy_cache and next_cache is not None:
         next_cache = next_cache.to_legacy_cache()
 
-    hidden_states = hidden_states[:, -1,:].unsqueeze(1)
+    if use_cache:
+      hidden_states = hidden_states[:, -1, :].unsqueeze(1)
 
     if not return_dict:
         return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)

@@ -59,7 +59,14 @@ def replace_mistral_fixed():
 def replace_mistral_adaptive():
     check_version()
     transformers.models.mistral.modeling_mistral.MistralForCausalLM.prepare_inputs_for_generation = ada_prepare_inputs_for_generation_mistral
-    transformers.models.mistral.modeling_mistral.MistralFlashAttention2.forward = adaptive_mistral_flash_attn2_forward
+
+    # Dynamic fallback for newer transformers versions
+    mistral_mod = transformers.models.mistral.modeling_mistral
+    if hasattr(mistral_mod, "MistralFlashAttention2"):
+        mistral_mod.MistralFlashAttention2.forward = adaptive_mistral_flash_attn2_forward
+    else:
+        mistral_mod.MistralAttention.forward = adaptive_mistral_flash_attn2_forward
+
     transformers.models.mistral.modeling_mistral.MistralModel.forward = adaptive_MistralModel_forward
 
 def replace_llama_fixed():
@@ -70,8 +77,15 @@ def replace_llama_fixed():
 
 def replace_llama_adaptive():
     check_version()
-    transformers.models.llama.modeling_llama.LlamaForCausalLM.prepare_inputs_for_generation = ada_prepare_inputs_for_generation_llama
-    transformers.models.llama.modeling_llama.LlamaFlashAttention2.forward = adaptive_llama_flash_attn2_forward
+    transformers.models.llama.modeling_llama.LlamaForCausalLM.prepare_inputs_for_generation =  ada_prepare_inputs_for_generation_llama
+
+    # Dynamic fallback for newer transformers versions
+    llama_mod = transformers.models.llama.modeling_llama
+    if hasattr(llama_mod, "LlamaFlashAttention2"):
+        llama_mod.LlamaFlashAttention2.forward = adaptive_llama_flash_attn2_forward
+    else:
+        llama_mod.LlamaAttention.forward = adaptive_llama_flash_attn2_forward
+
     transformers.models.llama.modeling_llama.LlamaModel.forward = adaptive_LlamaModel_forward
 
 
