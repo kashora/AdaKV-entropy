@@ -300,7 +300,9 @@ class SnapKVCluster():
 
 class AdaptiveSnapKVCluster():
     def __init__(self, window_size = 32, kernel_size = 7, pooling = 'maxpool',base_capacity=None,floor_alpha = None,skip = None,normalize=None, 
-                 layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20,gqa_support=False,num_key_value_groups = 1, gqa_func=None):
+                 layer_idx = None, num_hidden_layers = None, pyram_mode = False, pyram_beta = 20,gqa_support=False,num_key_value_groups = 1, gqa_func=None,
+                 use_entropy=False, entropy_alpha=2.0, entropy_computation='window', full_kv_scoring=False,
+                 entropy_tau1=None, entropy_tau2=None, entropy_low_frac=0.125, entropy_mid_frac=0.250, entropy_high_frac=1.0):
         self.window_size = window_size
         self.kernel_size = kernel_size
         self.pooling = pooling
@@ -316,6 +318,20 @@ class AdaptiveSnapKVCluster():
         self.pyram_beta = pyram_beta
         self.layer_idx = layer_idx
         self.num_hidden_layers = num_hidden_layers
+
+        # NOTE: entropy config
+        self.use_entropy = use_entropy
+        self.entropy_alpha = entropy_alpha
+        self.entropy_computation = entropy_computation
+        self.full_kv_scoring = full_kv_scoring
+        self.head_entropy = None
+
+        # NOTE: entropy budget params
+        self.entropy_tau1 = entropy_tau1
+        self.entropy_tau2 = entropy_tau2
+        self.entropy_low_frac = entropy_low_frac
+        self.entropy_mid_frac = entropy_mid_frac
+        self.entropy_high_frac = entropy_high_frac
 
         # NOTE: layer-wise meta-data
         self.head_lens = None
@@ -335,6 +351,52 @@ class AdaptiveSnapKVCluster():
             if self.num_key_value_groups == 1:
                 warnings.warn("gqa_support is enabled, but num_key_value_groups is 1, which means the model is not using gqa. Please check the model configuration.")
 
+
+    def compute_renyi_entropy_chunked(self, query_states, key_states):
+        """
+        Memory-efficient full-KV Rényi-2 entropy.
+
+        Processes queries in chunks of window_size to avoid materializing
+        the full [q_len, kv_len] attention matrix.
+
+        Rényi-2 entropy: H_2(p) = -log(Σ_j p_j^2)
+        where p = softmax(QK^T / sqrt(d)).
+
+        Using log-sum-exp trick per chunk:
+        H_2 = 2*log(Σ_j exp(x_j - m)) - log(Σ_j exp(2*(x_j - m)))
+        where x_j = q·k_j / sqrt(d) and m = max_j x_j
+
+        Args:
+            query_states: [1, num_heads, q_len, head_dim]
+            key_states: [1, num_heads, kv_len, head_dim]
+        Returns:
+            [1, num_heads] — average Rényi-2 entropy per head
+        """
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        scale = math.sqrt(head_dim)
+        chunk_size = min(self.window_size, q_len)
+
+        entropy_sum = torch.zeros(bsz, num_heads, device=query_states.device, dtype=torch.float32)
+
+        for start in range(0, q_len, chunk_size):
+            end = min(start + chunk_size, q_len)
+            q_chunk = query_states[:, :, start:end, :]
+
+            scores = torch.matmul(q_chunk.float(), key_states.transpose(2, 3).float()) / scale
+
+            m = scores.max(dim=-1, keepdim=True).values
+
+            exp_1 = torch.exp(scores - m)
+            exp_2 = torch.exp(2 * (scores - m))
+
+            sum_1 = exp_1.sum(dim=-1)
+            sum_2 = exp_2.sum(dim=-1)
+
+            entropy_pos = 2 * torch.log(sum_1 + 1e-10) - torch.log(sum_2 + 1e-10)
+            entropy_sum += entropy_pos.sum(dim=-1)
+
+        head_entropy = entropy_sum / q_len
+        return head_entropy
 
     def calcul_attn_sore(self, key_states, query_states):
         bsz, num_heads, q_len, head_dim = query_states.shape
@@ -363,6 +425,17 @@ class AdaptiveSnapKVCluster():
 
 
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+
+        # Entropy computation
+        if self.use_entropy:
+            if self.entropy_computation == 'full_chunked' and self.full_kv_scoring:
+                self.head_entropy = self.compute_renyi_entropy_chunked(query_states, key_states)
+            else:
+                p_alpha = attn_weights ** self.entropy_alpha
+                head_entropy = torch.log(p_alpha.sum(dim=-1) + 1e-10) / (1 - self.entropy_alpha)
+                head_entropy = head_entropy.mean(dim=-1)
+                self.head_entropy = head_entropy
+
         attn_weights_mean = attn_weights[:, :, -self.window_size:, : -self.window_size]
         if attn_weights_mean.shape[-1] == 0:
             bsz, num_heads, _, _ = attn_weights.shape
@@ -390,6 +463,37 @@ class AdaptiveSnapKVCluster():
             raise ValueError('Pooling method not supported')
         return attn_weights_mean_pooling
     
+    def compute_entropy_budget(self, head_entropy):
+        """
+        Tiered step-function budget allocation based on Rényi entropy.
+        
+        LOW:  H2 ≤ τ₁   → frac = 0.125
+        MID:  τ₁ < H2 ≤ τ₂ → frac = 0.250
+        HIGH: H2 > τ₂   → frac = 1.000
+        
+        Budget: k_h = L × frac(H2_h) where L = total_budget / Σ frac
+        """
+        num_heads = head_entropy.shape[-1]
+        total_budget = self.base_capacity * num_heads
+
+        if self.entropy_tau1 is None or self.entropy_tau2 is None:
+            sorted_h, _ = head_entropy.sort(dim=-1)
+            tau1 = sorted_h[0, max(num_heads // 3, 0)]
+            tau2 = sorted_h[0, max(2 * num_heads // 3, 0)]
+        else:
+            tau1, tau2 = self.entropy_tau1, self.entropy_tau2
+
+        fracs = torch.zeros_like(head_entropy, dtype=torch.float32)
+        fracs[head_entropy <= tau1] = self.entropy_low_frac
+        fracs[(head_entropy > tau1) & (head_entropy <= tau2)] = self.entropy_mid_frac
+        fracs[head_entropy > tau2] = self.entropy_high_frac
+
+        L = total_budget / fracs.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        budgets = torch.round(L * fracs).int()
+        budgets = torch.maximum(budgets, torch.tensor(self.floor_capacity, device=budgets.device, dtype=budgets.dtype))
+
+        return budgets
+
     def update_kv(self, origin_key_states, query_states, origin_value_states):
         if self.gqa_support:
             return self.update_kv_gqa(origin_key_states, query_states, origin_value_states)
@@ -465,20 +569,30 @@ class AdaptiveSnapKVCluster():
 
         sorted_attn_score,sorted_attn_score_indices = attn_score.sort(dim=-1,descending=True)
         if self.layer_idx >= self.skip:
-            adaptive_attn_score = sorted_attn_score
-            length = adaptive_attn_score.size(dim=-1)
-            if self.normalize:
-                ratio_weight = sorted_attn_score[...,:self.base_capacity].sum(dim=-1,keepdim=True)/sorted_attn_score.sum(dim=-1,keepdim=True)
-                adaptive_attn_score = adaptive_attn_score*ratio_weight
-            adaptive_attn_score = adaptive_attn_score.reshape(bsz,length*num_heads//self.num_key_value_groups)
-            sorted_indices = torch.topk(adaptive_attn_score,k=num_heads*self.base_capacity//self.num_key_value_groups,dim=-1).indices
-            sorted_indices = sorted_indices//length
+            
+          if self.use_entropy and self.head_entropy is not None:
+              if self.gqa_support and self.num_key_value_groups > 1:
+                  h_e = self.head_entropy.view(bsz, num_heads // self.num_key_value_groups, self.num_key_value_groups).mean(dim=-1)
+              else:
+                  h_e = self.head_entropy
+              head_adaptive_capacity = self.compute_entropy_budget(h_e)
+          else:
+              adaptive_attn_score = sorted_attn_score
 
-            # floor_alpha capacity set
-            head_adaptive_capacity = torch.zeros((bsz,num_heads//self.num_key_value_groups),device=_device,dtype = sorted_indices.dtype)
-            head_adaptive_capacity.scatter_add_(-1,sorted_indices,torch.ones_like(sorted_indices,dtype=head_adaptive_capacity.dtype),)
-            assert head_adaptive_capacity.sum().item() == num_heads*self.base_capacity//self.num_key_value_groups
-            head_adaptive_capacity = torch.round(head_adaptive_capacity * (1-self.floor_ratio) + self.floor_capacity).int()
+              adaptive_attn_score = sorted_attn_score
+              length = adaptive_attn_score.size(dim=-1)
+              if self.normalize:
+                  ratio_weight = sorted_attn_score[...,:self.base_capacity].sum(dim=-1,keepdim=True)/sorted_attn_score.sum(dim=-1,keepdim=True)
+                  adaptive_attn_score = adaptive_attn_score*ratio_weight
+              adaptive_attn_score = adaptive_attn_score.reshape(bsz,length*num_heads//self.num_key_value_groups)
+              sorted_indices = torch.topk(adaptive_attn_score,k=num_heads*self.base_capacity//self.num_key_value_groups,dim=-1).indices
+              sorted_indices = sorted_indices//length
+
+              # floor_alpha capacity set
+              head_adaptive_capacity = torch.zeros((bsz,num_heads//self.num_key_value_groups),device=_device,dtype = sorted_indices.dtype)
+              head_adaptive_capacity.scatter_add_(-1,sorted_indices,torch.ones_like(sorted_indices,dtype=head_adaptive_capacity.dtype),)
+              assert head_adaptive_capacity.sum().item() == num_heads*self.base_capacity//self.num_key_value_groups
+              head_adaptive_capacity = torch.round(head_adaptive_capacity * (1-self.floor_ratio) + self.floor_capacity).int()
         else:
             head_adaptive_capacity = torch.ones((bsz,num_heads),device=_device,dtype = sorted_attn_score_indices.dtype) * self.base_capacity
         sorted_attn_score_indices = sorted_attn_score_indices.split(1,dim=1)
@@ -584,19 +698,24 @@ class AdaptiveSnapKVCluster():
         pass
         sorted_attn_score,sorted_attn_score_indices = attn_score.sort(dim=-1,descending=True)
         if self.layer_idx >= self.skip:
-            adaptive_attn_score = sorted_attn_score
-            length = adaptive_attn_score.size(dim=-1)
-            if self.normalize:
-                ratio_weight = sorted_attn_score[...,:self.base_capacity].sum(dim=-1,keepdim=True)/sorted_attn_score.sum(dim=-1,keepdim=True)
-                adaptive_attn_score = adaptive_attn_score*ratio_weight
-            adaptive_attn_score = adaptive_attn_score.reshape(bsz,length*num_heads)
-            sorted_indices = torch.topk(adaptive_attn_score,k=num_heads*self.base_capacity,dim=-1).indices
-            sorted_indices = sorted_indices//length
-            # floor_alpha capacity set
-            head_adaptive_capacity = torch.zeros((bsz,num_heads),device=_device,dtype = sorted_indices.dtype)
-            head_adaptive_capacity.scatter_add_(-1,sorted_indices,torch.ones_like(sorted_indices,dtype=head_adaptive_capacity.dtype),)
-            assert head_adaptive_capacity.sum().item() == num_heads*self.base_capacity
-            head_adaptive_capacity = torch.round(head_adaptive_capacity * (1-self.floor_ratio) + self.floor_capacity).int()
+            if self.use_entropy and self.head_entropy is not None:
+                head_adaptive_capacity = self.compute_entropy_budget(self.head_entropy)
+            else:
+                adaptive_attn_score = sorted_attn_score
+
+                adaptive_attn_score = sorted_attn_score
+                length = adaptive_attn_score.size(dim=-1)
+                if self.normalize:
+                    ratio_weight = sorted_attn_score[...,:self.base_capacity].sum(dim=-1,keepdim=True)/sorted_attn_score.sum(dim=-1,keepdim=True)
+                    adaptive_attn_score = adaptive_attn_score*ratio_weight
+                adaptive_attn_score = adaptive_attn_score.reshape(bsz,length*num_heads)
+                sorted_indices = torch.topk(adaptive_attn_score,k=num_heads*self.base_capacity,dim=-1).indices
+                sorted_indices = sorted_indices//length
+                # floor_alpha capacity set
+                head_adaptive_capacity = torch.zeros((bsz,num_heads),device=_device,dtype = sorted_indices.dtype)
+                head_adaptive_capacity.scatter_add_(-1,sorted_indices,torch.ones_like(sorted_indices,dtype=head_adaptive_capacity.dtype),)
+                assert head_adaptive_capacity.sum().item() == num_heads*self.base_capacity
+                head_adaptive_capacity = torch.round(head_adaptive_capacity * (1-self.floor_ratio) + self.floor_capacity).int()
         else:
             head_adaptive_capacity = torch.ones((bsz,num_heads),device=_device,dtype = sorted_attn_score_indices.dtype) * self.base_capacity
         sorted_attn_score_indices = sorted_attn_score_indices.split(1,dim=1)
@@ -693,12 +812,16 @@ def init_adaptive_snapkv(self):
             pyram_beta = self.config.pyram_beta,
             gqa_support = self.config.gqa_support,
             num_key_value_groups = self.config.num_attention_heads // self.config.num_key_value_heads,
-            gqa_func = self.config.gqa_func
+            gqa_func = self.config.gqa_func,
+            use_entropy = getattr(self.config, 'use_entropy', False),
+            entropy_alpha = getattr(self.config, 'entropy_alpha', 2.0),
+            entropy_computation = getattr(self.config, 'entropy_computation', 'window'),
+            full_kv_scoring = getattr(self.config, 'full_kv_scoring', False),
             )
         if self.config.gqa_support:
             if self.config.model_type != "mistral":
                 warnings.warn("GQA currently supports only for mistral-7B-v0.2 model")
-        print(f"Compress config(Ada): window_size={self.kv_cluster.window_size}, base_capacity={self.kv_cluster.base_capacity}, kernel_size={self.kv_cluster.kernel_size}, pooling={self.kv_cluster.pooling}, floor_alpha={self.kv_cluster.floor_ratio}, pyram_mode={self.kv_cluster.pyram_mode}, beta={self.kv_cluster.pyram_beta}", flush=True)
+        print(f"Compress config(Ada): window_size={self.kv_cluster.window_size}, base_capacity={self.kv_cluster.base_capacity}, kernel_size={self.kv_cluster.kernel_size}, pooling={self.kv_cluster.pooling}, floor_alpha={self.kv_cluster.floor_ratio}, pyram_mode={self.kv_cluster.pyram_mode}, beta={self.kv_cluster.pyram_beta}, use_entropy={self.kv_cluster.use_entropy}, entropy_computation={self.kv_cluster.entropy_computation}", flush=True)
 
 
 

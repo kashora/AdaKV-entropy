@@ -31,7 +31,7 @@ def check_version():
 
 
 # config hyperparameters
-def config_compress(model, window_size=32, base_capacity=1024, kernel_size=7, pooling="maxpool", floor_alpha=0.5, pyram_mode = False, beta = 20, skip=0, gqa_support=False,gqa_func="mean"):
+def config_compress(model, window_size=32, base_capacity=1024, kernel_size=7, pooling="maxpool", floor_alpha=0.5, pyram_mode = False, beta = 20, skip=0, gqa_support=False,gqa_func="mean", use_entropy=False, entropy_alpha=2.0, entropy_computation='window', full_kv_scoring=False):
     model.model.config.window_size = window_size
     model.model.config.base_capacity = base_capacity
     model.model.config.kernel_size = kernel_size
@@ -46,6 +46,11 @@ def config_compress(model, window_size=32, base_capacity=1024, kernel_size=7, po
 
     model.model.config.gqa_support = gqa_support
     model.model.config.gqa_func = gqa_func
+
+    model.model.config.use_entropy = use_entropy
+    model.model.config.entropy_alpha = entropy_alpha
+    model.model.config.entropy_computation = entropy_computation
+    model.model.config.full_kv_scoring = full_kv_scoring
 
     return model
 

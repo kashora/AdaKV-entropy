@@ -169,3 +169,6 @@ experiments/LongBench/*pred
 experiments/LongBench/runall_*.sh
 .vscode
 .idea
+*.json
+*.md
+*.jsonl
